@@ -49,8 +49,15 @@ class CM11(SerialX10Controller):
         "16": 0xC
         }
     
-    HD_SEL = 0x04
-    HD_FUN = 0x06
+    # Transmit Constants
+    HD_SEL          = 0x04      # Header byte to address a device
+    HD_FUN          = 0x06      # Header byte to send a function command
+    POLL_RESPONSE   = 0xC3      # Respond to a device's poll request
+    POLL_PF_RESP    = 0xFB      # Respond to power fail poll
+    
+    # Receive Constants
+    POLL_REQUEST    = 0x5A      # Poll request from CM11A
+    POLL_POWER_FAIL = 0xA5      # Poll request indicating power fail
     
     def __init__(self, aDevice):
         X10Controller.__init__(self, aDevice)
@@ -60,11 +67,21 @@ class CM11(SerialX10Controller):
         SerialX10Controller.open(self)
         while True:
             data = self.read()
-            print data
-            if data == 0xA5:
-                self.write(0x9B)
             if data == "":
                 break
+    
+    # Override the read command.  Occasionally, a Poll message might be
+    # be received.  The CM11A does not like it if the computer does not respond
+    # to the poll.  Then read another byte.
+    def read(self):
+        data = SerialX10Controller.read(self)
+        if data == self.POLL_POWER_FAIL:
+            self.write(self.POLL_PF_RESP)
+            data = SerialX10Controller.read(self)
+        elif data == self.POLL_REQUEST:
+            self.write(self.POLL_RESPONSE)
+            data = SerialX10Controller.read(self)
+        return( data )
     
     def ack(self):
         return True

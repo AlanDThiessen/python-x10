@@ -1,2 +1,5 @@
 *.pyc
 Python_X10.egg-info
+.project
+.pydevproject
+
