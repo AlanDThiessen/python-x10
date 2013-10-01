@@ -52,6 +52,7 @@ class CM11(SerialX10Controller):
     # Transmit Constants
     HD_SEL          = 0x04      # Header byte to address a device
     HD_FUN          = 0x06      # Header byte to send a function command
+    MAX_DIM         = 22        # Maximum Dim/Bright amount
     POLL_RESPONSE   = 0xC3      # Respond to a device's poll request
     POLL_PF_RESP    = 0xFB      # Respond to power fail poll
     
@@ -101,9 +102,19 @@ class CM11(SerialX10Controller):
     def do(self, function, x10addr=None, amount=None):
         cmd = (encodeX10HouseCode(x10addr[0], self) << 4) | function
         checksum = 0x00
+
+        # For the BRIGHT and DIM Commands, need to or in the amount to dim
+        # into the top 5 bits of the header
+        header = self.HD_FUN
+        if amount > self.MAX_DIM:
+            amount = self.MAX_DIM
+            
+        if( ( function == functions.DIM    ) or
+            ( function == functions.BRIGHT ) ):
+            header |= (amount << 3)
         
-        while checksum != self.HD_FUN+cmd:
-            self.write(self.HD_FUN)
+        while checksum != (header+cmd)&0x00FF:
+            self.write(header)
             self.write(cmd)
             checksum = self.read()
         self.write(0x00)
