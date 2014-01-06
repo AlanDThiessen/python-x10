@@ -54,7 +54,7 @@ class X10Controller(object):
         """
         raise NotImplementedError()
 
-    def actuator(self, x10addr, aX10ActuatorKlass=None):
+    def actuator(self, x10addr=None, aX10ActuatorKlass=None):
         """
         Given an address, return a device object.
         If an actuator class is provided, use it.
@@ -89,8 +89,8 @@ class SerialX10Controller(X10Controller):
         X10Controller.__init__(self, aDevice)
         self._baudrate = baudrate
 
-    def open(self):
-        self._handle = serial.Serial(self._device, baudrate=self._baudrate, timeout=1)
+    def open(self, timeout):
+        self._handle = serial.Serial(self._device, baudrate=self._baudrate, timeout=timeout)
 
     def _set_standby(self):
         """

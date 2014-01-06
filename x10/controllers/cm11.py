@@ -1,13 +1,403 @@
+import logging
+import Queue
 import serial
+import threading
+import time
 
 from .abstract import SerialX10Controller, X10Controller
-
 from ..utils import encodeX10HouseCode, encodeX10UnitCode, encodeX10Address
-
 from x10.protocol import functions
 
-class CM11(SerialX10Controller):
+logger = logging.getLogger(__name__)
+
+CM11_BAUD       = 4800
+
+# Transmit Constants
+HD_SEL          = 0x04      # Header byte to address a device
+HD_FUN          = 0x06      # Header byte to send a function command
+XMIT_OK         = 0x00      # Ok for Transmission
+MAX_DIM         = 22        # Maximum Dim/Bright amount
+POLL_RESPONSE   = 0xC3      # Respond to a device's poll request
+POLL_PF_RESP    = 0x9B      # Respond to power fail poll
+
+# Receive Constants
+POLL_REQUEST    = 0x5A      # Poll request from CM11A
+POLL_POWER_FAIL = 0xA5      # Poll request indicating power fail
+INTERFACE_READY = 0x55      # The interface is ready
+MAX_READ_BYTES  = 10        # The maximum number of bytes in the buffer after the size
+
+
+class TransactionQueue(Queue.PriorityQueue):
+    # Transaction Queue priorities
+    ( PRI_EXIT,
+      PRI_IMMEDIATE,
+      PRI_NORMAL
+    ) = range(3)
     
+    def __init__(self):
+        Queue.PriorityQueue.__init__(self)
+    
+    def AddTransaction(self, priority, transaction):
+        self.put( ( priority, transaction ) )
+        
+    def GetTransaction(self):
+        (priority, transaction) = self.get()
+        return transaction   
+
+
+class MessageQueue(Queue.PriorityQueue):
+    # Queue priorities
+    ( PRI_IMMEDIATE,
+      PRI_SERIAL,
+      PRI_RESPONSE,
+      PRI_COMMAND
+    ) = range(4)
+    
+    def __init__(self):
+        Queue.PriorityQueue.__init__(self)
+    
+    def AddMessage(self, message, priority=PRI_SERIAL):
+        self.put( ( priority, message ) )
+        
+    def GetMessage(self):
+        try:
+            (priority, message) = self.get( True, 3 )
+            return message
+        except Queue.Empty:
+            print "Message Queue Empty!"
+            return None
+        except:
+            return None
+            
+
+
+# Classes to handle transactions
+# This is the base class
+class Transaction(object):
+    def __init__(self, controller):
+        self.controller = controller
+        
+    def Start(self):
+        """
+        Start the Transaction
+        """
+        raise NotImplementedError()
+    
+    def HandleMessage(self, message):
+        """
+        Process a message from the serial port
+        """
+        raise NotImplementedError()
+    
+    def IsComplete(self):
+        """
+        Returns whether the transaction is complete or not
+        """
+        return True        
+
+class ExitTransaction(Transaction):
+    def Start(self):
+        print "Starting exit transition"
+        return False
+
+class CommandTransaction(Transaction):
+    ( ACTION_ADDRESS,
+      ACTION_FUNCTION
+    ) = range(2)
+    
+    ( STATE_VALIDATE_CHECKSUM,
+      STATE_WAIT_READY,
+      STATE_COMPLETE
+    ) = range(3)
+    
+    MAX_ATTEMPTS = 5
+    
+    def __init__(self, controller, function, units, amount):
+        Transaction.__init__(self, controller)
+        self.units          = units
+        self.function       = function
+        self.amount         = amount
+        self.numAttempts    = 0
+        self.currentUnit    = 0
+        self.checksum       = 0
+
+    def Start(self):
+        if( self.AddressUnit() ):
+            self.state = self.STATE_VALIDATE_CHECKSUM
+        else:
+            self.state = self.STATE_COMPLETE
+            
+        return True
+        
+    def HandleMessage(self, message):
+        data = -1
+
+        if( ( message.id == QueueMessage.MSG_READ ) and ( len( message.data ) >= 1 ) ):
+            data = message.data[0]
+            
+        if  ( self.state == self.STATE_VALIDATE_CHECKSUM ):
+            self.StateValidateChecksum( data )
+        elif( self.state == self.STATE_WAIT_READY        ):
+            self.StateWaitReady( data )
+        
+    def IsComplete(self):
+        return( self.state == self.STATE_COMPLETE )
+
+    def StateValidateChecksum(self, checksum):
+        print "   State Validate Checksum"
+
+        if( checksum == self.checksum ):
+            print "   Checksum Valid"
+            # Since checksum matches, reset the number of attempts
+            # and send Ok for Transmission
+            self.numAttempts = 0
+            self.controller.write( XMIT_OK )
+            self.state = self.STATE_WAIT_READY
+        else:
+            print "   Checksum Invalid"
+            # Checksum mistmach, increment number of attempts and try again
+            self.numAttempts += 1
+            
+            if( self.numAttempts > self.MAX_ATTEMPTS ):
+                print "   Max attempts reached"
+                self.state = self.STATE_COMPLETE
+            else:
+                if( self.action == self.ACTION_ADDRESS ):
+                    self.AddressUnit()
+                elif( self.action == self.ACTION_FUNCTION ):
+                    self.SendFunction()
+                    
+    def StateWaitReady(self, response):
+        print "   State Wait Ready"                    
+
+        if( response == INTERFACE_READY ):
+            print "   Interface ready"
+
+            if( self.action == self.ACTION_ADDRESS ):
+                # Increment the current unit
+                self.currentUnit += 1
+                
+                # See if we need to address another unit.
+                # If not, then send the function
+                if( not self.AddressUnit() ):
+                    self.SendFunction()
+                    
+                self.state = self.STATE_VALIDATE_CHECKSUM
+                
+            elif( self.action == self.ACTION_FUNCTION ):
+                self.state = self.STATE_COMPLETE
+        else:
+            print "   Device Not Read"
+            # Checksum mistmach, increment number of attempts and try again
+            self.numAttempts += 1
+
+            if( self.numAttempts > self.MAX_ATTEMPTS ):
+                print "   Max attempts reached"
+                self.state = self.STATE_COMPLETE
+            else:
+                self.state = self.STATE_VALIDATE_CHECKSUM
+                if( self.action == self.ACTION_ADDRESS ):
+                    self.AddressUnit()
+                elif( self.action == self.ACTION_FUNCTION ):
+                    self.SendFunction()
+
+    def AddressUnit(self):
+        if( self.currentUnit < len( self.units ) ):
+            print "   Address unit: ", self.units[self.currentUnit]
+            
+            self.action = self.ACTION_ADDRESS
+            x10Addr = ( encodeX10HouseCode( self.units[self.currentUnit][0], self.controller ) << 4 ) | encodeX10UnitCode( self.units[self.currentUnit][1:], self.controller )
+            self.controller.write( HD_SEL )
+            self.controller.write( x10Addr )
+            self.checksum = ( HD_SEL + x10Addr ) & 0x00FF
+            
+            return True
+        else:
+            return False
+        
+    def SendFunction(self):
+        print "   Send Function: ", self.function
+        self.action = self.ACTION_FUNCTION
+        
+        cmd = (encodeX10HouseCode(self.units[0][0], self.controller) << 4) | self.function
+
+        # For the BRIGHT and DIM Commands, need to or in the amount to dim
+        # into the top 5 bits of the header
+        header = HD_FUN
+        if self.amount > MAX_DIM:
+            self.amount = MAX_DIM
+            
+        if( ( self.function == functions.DIM    ) or
+            ( self.function == functions.BRIGHT ) ):
+            header |= (self.amount << 3)
+        
+        self.checksum = ( header + cmd ) & 0x00FF
+        self.controller.write( header )
+        self.controller.write( cmd )
+
+
+class PollTransaction(Transaction):
+    def Start(self):
+        self.readSize = None
+        self.data = []
+        self.controller.write( POLL_RESPONSE )
+        return True
+    
+    def HandleMessage(self, message):
+        if( self.readSize == None ):
+            self.readSize = message.data[0]
+            
+            if( self.readSize > MAX_READ_BYTES ):
+                self.readSize = MAX_READ_BYTES
+                
+        else:
+            self.data.append( message.data[0] )
+            
+            if( len( self.data ) >= self.readSize ):
+                self.ProcessData()
+
+    def IsComplete(self):
+        if( len( self.data ) >= self.readSize ):
+            return True
+        else:
+            return False
+        
+    def ProcessData(self):
+        print "   Process Data"
+
+
+class ClockTransaction(Transaction):
+    def Start(self):
+        print "Clock transaction starting"
+        # For now, just send the header to shut up the device
+        self.controller.write( POLL_PF_RESP )
+        time.sleep( 0.010 )
+        return True
+
+
+class MacroTransaction(Transaction):
+    def Start(self):
+        return True
+
+
+# Classes to handle threading
+class QueueMessage():
+    ( MSG_UNDEFINED,
+      MSG_EXIT,
+      MSG_READ,
+      MSG_WRITE,
+      MSG_TIMEOUT
+    ) = range(5)
+    
+    def __init__(self, id=MSG_UNDEFINED):
+        self.id     = id
+        self.data   = bytearray()
+
+
+class ThreadedSerialRead(threading.Thread):
+    ( STATE_EXIT,
+      STATE_BYTE,
+      STATE_BUFFER
+    ) = range(3)
+
+    def __init__(self, msgQueue, transQueue, controller):
+        threading.Thread.__init__(self)
+        self.msgQueue   = msgQueue
+        self.transQueue = transQueue
+        self.controller = controller
+        
+    def run(self):
+        print "Read thread started"
+        state = self.STATE_BYTE
+        
+        while state != self.STATE_EXIT:
+            
+            if state == self.STATE_BYTE:
+                state = self.ReadByte()
+            elif state == self.STATE_BUFFER:
+                state = self.ReadBuffer()
+                
+        print "Read thread exiting"
+        
+    def ReadByte(self):
+        newState = self.STATE_BYTE
+        
+        try:
+            data = self.controller.read()
+
+            if data != "":
+
+                if( data == POLL_REQUEST ):
+                    transaction = PollTransaction( self.controller );
+                    self.transQueue.AddTransaction( TransactionQueue.PRI_IMMEDIATE, transaction )
+                elif( data == POLL_POWER_FAIL ):
+                    transaction = ClockTransaction( self.controller );
+                    self.transQueue.AddTransaction( TransactionQueue.PRI_IMMEDIATE, transaction )
+                else:
+                    msg = QueueMessage( QueueMessage.MSG_READ )
+                    msg.data.append( data )
+                    self.msgQueue.AddMessage( msg )
+                    
+        except:
+            newState = self.STATE_EXIT
+            
+        return newState
+    
+    def ReadBuffer(self):
+        print "read buffer"
+        newState = self.STATE_BYTE
+
+        try:
+            size = self.controller.read()
+
+            if size != "":
+                if( ( size > 0 ) and ( size < MAX_READ_BYTES ) ):
+                    msg = QueueMessage( MSG_READ )
+                    while( --size ):
+                        msg.data.append( self.controller.read() )
+                    self.msgQueue.AddMessage( msg )
+                    
+        except ValueError:
+            newState = self.STATE_EXIT
+            
+        return newState
+
+    
+class ThreadProcessTransactions(threading.Thread):
+    STATE_EXIT      = 0
+    STATE_RUN       = 1
+
+    def __init__(self, msgQueue, transQueue, controller):
+        threading.Thread.__init__(self)
+        self.msgQueue   = msgQueue
+        self.transQueue = transQueue
+        self.controller = controller
+        
+    def run(self):
+        print "Process thread started"
+        time.sleep( 1.5 )
+        state = self.STATE_RUN
+        
+        while( state == self.STATE_RUN ):
+            # Suspend on the queue until a transaction arrives
+            transaction = self.transQueue.GetTransaction()
+            
+            # Start the transaction: The special exit transaction returns false at start
+            run = transaction.Start()
+
+            if( run ):
+                while( not transaction.IsComplete() ):
+                    message = self.msgQueue.GetMessage()
+                    if( message == None ):
+                        message = QueueMessage( QueueMessage.MSG_TIMEOUT )
+                    transaction.HandleMessage( message )
+            else:
+                state = self.STATE_EXIT
+                
+        print "Process thread ending"
+        
+
+class CM11(SerialX10Controller):
     # -----------------------------------------------------------
     # House and unit code table
     # -----------------------------------------------------------
@@ -49,73 +439,49 @@ class CM11(SerialX10Controller):
         "16": 0xC
         }
     
-    # Transmit Constants
-    HD_SEL          = 0x04      # Header byte to address a device
-    HD_FUN          = 0x06      # Header byte to send a function command
-    MAX_DIM         = 22        # Maximum Dim/Bright amount
-    POLL_RESPONSE   = 0xC3      # Respond to a device's poll request
-    POLL_PF_RESP    = 0xFB      # Respond to power fail poll
-    
-    # Receive Constants
-    POLL_REQUEST    = 0x5A      # Poll request from CM11A
-    POLL_POWER_FAIL = 0xA5      # Poll request indicating power fail
-    
     def __init__(self, aDevice):
-        X10Controller.__init__(self, aDevice)
-        self._baudrate = 4800
+        SerialX10Controller.__init__(self, aDevice, CM11_BAUD)
+        # The queue to use for communication
+        self.messages = MessageQueue()
+        # The queue to use for transactions
+        self.transactions = TransactionQueue()
         
     def open(self):
-        SerialX10Controller.open(self)
-        while True:
-            data = self.read()
-            if data == "":
-                break
-    
-    # Override the read command.  Occasionally, a Poll message might be
-    # be received.  The CM11A does not like it if the computer does not respond
-    # to the poll.  Then read another byte.
-    def read(self):
-        data = SerialX10Controller.read(self)
-        if data == self.POLL_POWER_FAIL:
-            self.write(self.POLL_PF_RESP)
-            data = SerialX10Controller.read(self)
-        elif data == self.POLL_REQUEST:
-            self.write(self.POLL_RESPONSE)
-            data = SerialX10Controller.read(self)
-        return( data )
+        # Open the serial port
+        SerialX10Controller.open(self, 1)
+                    
+        # Start the thread for reading 
+        self.readThread = ThreadedSerialRead( self.messages, self.transactions, self )
+        self.readThread.start()
+        
+        # Start the thread for processing/writing
+        self.processThread = ThreadProcessTransactions( self.messages, self.transactions, self )
+        self.processThread.start()
+        
+    def close(self):
+        print "Closing device..."
+        # Closing the serial port should cause the read thread to terminate
+        SerialX10Controller.close(self)
+        
+        # Send an exit
+        exit = ExitTransaction(self)
+        self.transactions.AddTransaction( TransactionQueue.PRI_EXIT, exit )
+        
+        # Now, wait for the threads to complete
+        print "Waiting for threads to end..."
+        self.readThread.join()
+        print "   read thread done"
+        self.processThread.join()
+        print "   process thread done"
     
     def ack(self):
         return True
     
-    def actuator(self, x10addr, aX10ActuatorKlass=None):
-        select = (encodeX10HouseCode(x10addr[0], self) << 4) | encodeX10UnitCode(x10addr[1:], self)
-        checksum = 0x00
-        
-        while checksum != self.HD_SEL+select:
-            self.write(self.HD_SEL)
-            self.write(select)
-            checksum = self.read()
-        self.write(0x00)
-        self.read()
+    def actuator(self, x10addr=None, aX10ActuatorKlass=None):
         return SerialX10Controller.actuator(self, x10addr, aX10ActuatorKlass=aX10ActuatorKlass)
-    
-    def do(self, function, x10addr=None, amount=None):
-        cmd = (encodeX10HouseCode(x10addr[0], self) << 4) | function
-        checksum = 0x00
 
-        # For the BRIGHT and DIM Commands, need to or in the amount to dim
-        # into the top 5 bits of the header
-        header = self.HD_FUN
-        if amount > self.MAX_DIM:
-            amount = self.MAX_DIM
-            
-        if( ( function == functions.DIM    ) or
-            ( function == functions.BRIGHT ) ):
-            header |= (amount << 3)
+    def do(self, function, units=None, amount=None):
+       transaction = CommandTransaction( self, function, units, amount )
+       self.transactions.AddTransaction( TransactionQueue.PRI_NORMAL, transaction )
+       
         
-        while checksum != (header+cmd)&0x00FF:
-            self.write(header)
-            self.write(cmd)
-            checksum = self.read()
-        self.write(0x00)
-        self.read()
