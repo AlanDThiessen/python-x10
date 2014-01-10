@@ -70,12 +70,12 @@ class MessageQueue(Queue.PriorityQueue):
             return None
             
 
-
 # Classes to handle transactions
 # This is the base class
 class Transaction(object):
-    def __init__(self, controller):
+    def __init__(self, controller, event=None):
         self.controller = controller
+        self.event = event
         
     def Start(self):
         """
@@ -93,7 +93,11 @@ class Transaction(object):
         """
         Returns whether the transaction is complete or not
         """
-        return True        
+        return True
+    
+    def SignalComplete(self):
+        if( self.event ):
+            self.event.set()
 
 class ExitTransaction(Transaction):
     def Start(self):
@@ -112,8 +116,8 @@ class CommandTransaction(Transaction):
     
     MAX_ATTEMPTS = 5
     
-    def __init__(self, controller, function, units, amount):
-        Transaction.__init__(self, controller)
+    def __init__(self, controller, function, units, amount, event):
+        Transaction.__init__(self, controller, event)
         self.units          = units
         self.function       = function
         self.amount         = amount
@@ -375,6 +379,12 @@ class ThreadProcessTransactions(threading.Thread):
         
     def run(self):
         print "Process thread started"
+        
+        # The CM11A device sends the Power Fail poll every second after initial
+        # power-up, and will not respond to commands until that poll is satisfied.
+        # This sleep ensures the read thread has an opportunity to see the poll
+        # and send a high-priority Power Fail transaction, ensuring this is the
+        # first transaction processed.
         time.sleep( 1.5 )
         state = self.STATE_RUN
         
@@ -391,6 +401,7 @@ class ThreadProcessTransactions(threading.Thread):
                     if( message == None ):
                         message = QueueMessage( QueueMessage.MSG_TIMEOUT )
                     transaction.HandleMessage( message )
+                transaction.SignalComplete()
             else:
                 state = self.STATE_EXIT
                 
@@ -439,12 +450,13 @@ class CM11(SerialX10Controller):
         "16": 0xC
         }
     
-    def __init__(self, aDevice):
+    def __init__(self, aDevice, suspend=False):
         SerialX10Controller.__init__(self, aDevice, CM11_BAUD)
         # The queue to use for communication
         self.messages = MessageQueue()
         # The queue to use for transactions
         self.transactions = TransactionQueue()
+        self.suspend = suspend
         
     def open(self):
         # Open the serial port
@@ -476,12 +488,18 @@ class CM11(SerialX10Controller):
     
     def ack(self):
         return True
-    
-    def actuator(self, x10addr=None, aX10ActuatorKlass=None):
-        return SerialX10Controller.actuator(self, x10addr, aX10ActuatorKlass=aX10ActuatorKlass)
 
-    def do(self, function, units=None, amount=None):
-       transaction = CommandTransaction( self, function, units, amount )
-       self.transactions.AddTransaction( TransactionQueue.PRI_NORMAL, transaction )
-       
+    def do(self, function, units=None, amount=None, suspend=None):
+        event = None
+        
+        if( self.suspend ):
+            event = threading.Event()
+        
+        transaction = CommandTransaction( self, function, units, amount, event )
+        self.transactions.AddTransaction( TransactionQueue.PRI_NORMAL, transaction )
+        
+        if( self.suspend ):
+            print "Waiting for event..."
+            event.wait()
+            print "Event Done!"
         
