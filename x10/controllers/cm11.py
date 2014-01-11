@@ -101,7 +101,7 @@ class Transaction(object):
 
 class ExitTransaction(Transaction):
     def Start(self):
-        print "Starting exit transition"
+        logger.debug( "********** Starting Exit transaction **********" )
         return False
 
 class CommandTransaction(Transaction):
@@ -126,6 +126,7 @@ class CommandTransaction(Transaction):
         self.checksum       = 0
 
     def Start(self):
+        logger.debug( "********** Starting Command Transaction **********" )
         if( self.AddressUnit() ):
             self.state = self.STATE_VALIDATE_CHECKSUM
         else:
@@ -154,7 +155,7 @@ class CommandTransaction(Transaction):
             print "   Checksum Valid"
             # Since checksum matches, reset the number of attempts
             # and send Ok for Transmission
-            self.numAttempts = 0
+            #self.numAttempts = 0
             self.controller.write( XMIT_OK )
             self.state = self.STATE_WAIT_READY
         else:
@@ -191,7 +192,7 @@ class CommandTransaction(Transaction):
             elif( self.action == self.ACTION_FUNCTION ):
                 self.state = self.STATE_COMPLETE
         else:
-            print "   Device Not Read"
+            print "   Device Not Ready"
             # Checksum mistmach, increment number of attempts and try again
             self.numAttempts += 1
 
@@ -247,25 +248,26 @@ class PollTransaction(Transaction):
         logger.debug( "New poll transaction" )
         
     def Start(self):
-        logger.debug( "Poll transaction starting")
+        logger.debug( "********** Starting Poll Transaction **********" )
         self.readSize = None
         self.data = []
         self.controller.write( POLL_RESPONSE )
         return True
     
     def HandleMessage(self, message):
-        if( self.readSize == None ):
-            self.readSize = message.data[0]
-            logger.debug( "Poll transaction: readSize: %d", self.readSize)
-            
-            if( self.readSize > MAX_READ_BYTES ):
-                self.readSize = MAX_READ_BYTES
+        if( ( message.id == QueueMessage.MSG_READ ) and ( len( message.data ) >= 1 ) ):
+            if( self.readSize == None ):
+                self.readSize = message.data[0]
+                logger.debug( "Poll transaction: readSize: %d", self.readSize)
                 
-        else:
-            self.data.append( message.data[0] )
-            
-            if( len( self.data ) >= self.readSize ):
-                self.controller.DecodeData( self.data )
+                if( self.readSize > MAX_READ_BYTES ):
+                    self.readSize = MAX_READ_BYTES
+                    
+            else:
+                self.data.append( message.data[0] )
+                
+                if( len( self.data ) >= self.readSize ):
+                    self.controller.DecodeData( self.data )
 
     def IsComplete(self):
         if( ( self.readSize != None ) and ( len( self.data ) >= self.readSize ) ):
@@ -277,7 +279,7 @@ class PollTransaction(Transaction):
 
 class ClockTransaction(Transaction):
     def Start(self):
-        print "Clock transaction starting"
+        logger.debug( "********** Starting Clock Transaction **********" )
         # For now, just send the header to shut up the device
         self.controller.write( POLL_PF_RESP )
         time.sleep( 0.010 )
@@ -286,6 +288,7 @@ class ClockTransaction(Transaction):
 
 class MacroTransaction(Transaction):
     def Start(self):
+        logger.debug( "********** Starting Macro Transaction **********" )
         return True
 
 
@@ -296,13 +299,14 @@ class StatusRequestTransaction(Transaction):
         logger.debug( "New status transaction" )
         
     def Start(self):
-        logger.debug( "Status transaction starting")
+        logger.debug( "********** Starting Status Request Transaction **********" )
         self.readSize = STAUS_REQUEST_NUM_BYTES
         self.data = []
         self.controller.write( STATUS_REQUEST )
         return True
     
     def HandleMessage(self, message):
+        if( ( message.id == QueueMessage.MSG_READ ) and ( len( message.data ) >= 1 ) ):
             self.data.append( message.data[0] )
             
             if( len( self.data ) >= self.readSize ):
@@ -466,6 +470,11 @@ class CM11(SerialX10Controller):
         }
     
     def __init__(self, aDevice, suspend=False):
+        num = getattr( logging, 'DEBUG' )
+        if not isinstance( num, int ):
+            raise ValueError( 'Invalid log level: %s' % 'DEBUG' )
+        logging.basicConfig( level=num )
+
         SerialX10Controller.__init__(self, aDevice, CM11_BAUD)
         # The queue to use for communication
         self.messages = MessageQueue()
