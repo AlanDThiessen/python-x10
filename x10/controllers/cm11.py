@@ -5,7 +5,7 @@ import threading
 import time
 
 from .abstract import SerialX10Controller, X10Controller
-from ..utils import encodeX10HouseCode, encodeX10UnitCode, encodeX10Address
+from ..utils import *
 from x10.protocol import functions
 
 logger = logging.getLogger(__name__)
@@ -25,8 +25,9 @@ POLL_PF_RESP            = 0x9B      # Respond to power fail poll
 POLL_REQUEST            = 0x5A      # Poll request from CM11A
 POLL_POWER_FAIL         = 0xA5      # Poll request indicating power fail
 INTERFACE_READY         = 0x55      # The interface is ready
-MAX_READ_BYTES          = 10        # The maximum number of bytes in the buffer after the size
+MAX_READ_BYTES          = 9         # The maximum number of bytes in the buffer after the size
 STAUS_REQUEST_NUM_BYTES = 14        # The number of bytes to read for a status request
+DIM_BRIGHT_MAX          = 210
 
 
 class TransactionQueue(Queue.PriorityQueue):
@@ -264,7 +265,7 @@ class PollTransaction(Transaction):
             self.data.append( message.data[0] )
             
             if( len( self.data ) >= self.readSize ):
-                self.ProcessData()
+                self.controller.DecodeData( self.data )
 
     def IsComplete(self):
         if( ( self.readSize != None ) and ( len( self.data ) >= self.readSize ) ):
@@ -272,10 +273,6 @@ class PollTransaction(Transaction):
             return True
         else:
             return False
-        
-    def ProcessData(self):
-        logger.debug( "Poll transaction: Process Data " )
-        print self.data
 
 
 class ClockTransaction(Transaction):
@@ -506,12 +503,6 @@ class CM11(SerialX10Controller):
     
     def ack(self):
         return True
-    
-    def StatusRequest(self):
-        self.do( functions.STATREQ )
-        
-    def StatusResponse(self, data):
-        print "Status Response: ", data
 
     def do(self, function, units=None, amount=None ):
         event = None
@@ -530,4 +521,45 @@ class CM11(SerialX10Controller):
             print "Waiting for event..."
             event.wait()
             print "Event Done!"
+    
+    def StatusRequest(self):
+        self.do( functions.STATREQ )
         
+    def StatusResponse(self, data):
+        print "Status Response: ", data
+
+    def DecodeData(self, data):
+        # First, get the Function/Address mask from the first byte
+        index = 0
+        funcAddrMask = data[index]
+        index += 1
+        
+        # The size is the number of bytes remaining
+        size = len( data ) - 1
+        
+        try:
+            while size:
+                # If the bit in the mask is a 1, the corresponding data byte is a function
+                # If the bit in the mask is a 0, the corresponding data byte is a house code
+                if( funcAddrMask & 0x01 ):
+                    functionCode = data[index] & 0x0F
+                    functionName = encodeFunctionName( functionCode, self )
+                    houseCode = decodeX10HouseCode( data[index] >> 4, self )
+                    
+                    if( ( functionCode == functions.DIM ) or ( functionCode == functions.BRIGHT ) ):
+                        index += 1
+                        size -= 1
+                        amount = round( data[index] * 100 / DIM_BRIGHT_MAX )
+                        logger.debug( "House: %1s, Function: %s (%d), Amount: %.0f%%", houseCode, functionName, functionCode, amount )
+                    else:
+                        logger.debug( "House, %1s, Function: %s (%d)", houseCode, functionName, functionCode )
+                        
+                else:
+                    unitCode = decodeX10Address( data[index], self )
+                    logger.debug( "Unit: %s", unitCode )
+                    
+                funcAddrMask = funcAddrMask >> 1
+                index += 1
+                size -= 1
+        except:
+            logger.debug( "Decode Failure" )

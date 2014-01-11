@@ -7,12 +7,31 @@ import serial, binascii
 from x10.devices.actuators import GenericX10Actuator
 from x10.devices.house import X10House
 from x10.exceptions import WriteError
+from x10.protocol import functions
 
 logger = logging.getLogger(__name__)
 
 class X10Controller(object):
     HOUSE_ENCMAP = {} # Encoding Map for House Code
     UNIT_ENCMAP = {} # Encoding Map for Unit Code
+    FUNCTION_NAMES = {
+                      functions.ALLUOFF     : "All Units Off",
+                      functions.ALLLON      : "All Lights On",
+                      functions.ON          : "On",
+                      functions.OFF         : "Off",
+                      functions.DIM         : "Dim",
+                      functions.BRIGHT      : "Bright",
+                      functions.ALLLOFF     : "All Lights Off",
+                      functions.EXTENDCODE  : "Extended Code",
+                      functions.HAILREQ     : "Hail Request",
+                      functions.HAILACK     : "Hail Acknowledge",
+                      functions.PDIML       : "Pre-set Dim (1)",
+                      functions.PDIMH       : "Pre-set Dim (2)",
+                      functions.EXTENDDATA  : "Extended Data Transfer",
+                      functions.STATON      : "Status On",
+                      functions.STATOFF     : "Status Off",
+                      functions.STATREQ     : "Status Request"
+                    }
 
     def __init__(self, aDevice):
         self._device = aDevice

@@ -16,11 +16,3 @@ class functions(object):
      STATON,
      STATOFF,
      STATREQ) = range(16)
-             
-
-
-
-
-
-
-
