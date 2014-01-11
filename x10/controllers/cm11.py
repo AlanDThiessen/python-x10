@@ -13,18 +13,20 @@ logger = logging.getLogger(__name__)
 CM11_BAUD       = 4800
 
 # Transmit Constants
-HD_SEL          = 0x04      # Header byte to address a device
-HD_FUN          = 0x06      # Header byte to send a function command
-XMIT_OK         = 0x00      # Ok for Transmission
-MAX_DIM         = 22        # Maximum Dim/Bright amount
-POLL_RESPONSE   = 0xC3      # Respond to a device's poll request
-POLL_PF_RESP    = 0x9B      # Respond to power fail poll
+HD_SEL                  = 0x04      # Header byte to address a device
+HD_FUN                  = 0x06      # Header byte to send a function command
+XMIT_OK                 = 0x00      # Ok for Transmission
+MAX_DIM                 = 22        # Maximum Dim/Bright amount
+POLL_RESPONSE           = 0xC3      # Respond to a device's poll request
+STATUS_REQUEST          = 0x8B      # Request status from the device
+POLL_PF_RESP            = 0x9B      # Respond to power fail poll
 
 # Receive Constants
-POLL_REQUEST    = 0x5A      # Poll request from CM11A
-POLL_POWER_FAIL = 0xA5      # Poll request indicating power fail
-INTERFACE_READY = 0x55      # The interface is ready
-MAX_READ_BYTES  = 10        # The maximum number of bytes in the buffer after the size
+POLL_REQUEST            = 0x5A      # Poll request from CM11A
+POLL_POWER_FAIL         = 0xA5      # Poll request indicating power fail
+INTERFACE_READY         = 0x55      # The interface is ready
+MAX_READ_BYTES          = 10        # The maximum number of bytes in the buffer after the size
+STAUS_REQUEST_NUM_BYTES = 13        # The number of bytes to read for a status request
 
 
 class TransactionQueue(Queue.PriorityQueue):
@@ -241,7 +243,13 @@ class CommandTransaction(Transaction):
 
 
 class PollTransaction(Transaction):
+    
+    def __init__(self, controller):
+        Transaction.__init__(self, controller)
+        logger.debug( "New poll transaction" )
+        
     def Start(self):
+        logger.debug( "Poll transaction starting")
         self.readSize = None
         self.data = []
         self.controller.write( POLL_RESPONSE )
@@ -250,6 +258,7 @@ class PollTransaction(Transaction):
     def HandleMessage(self, message):
         if( self.readSize == None ):
             self.readSize = message.data[0]
+            logger.debug( "Poll transaction: readSize: %d", self.readSize)
             
             if( self.readSize > MAX_READ_BYTES ):
                 self.readSize = MAX_READ_BYTES
@@ -261,13 +270,17 @@ class PollTransaction(Transaction):
                 self.ProcessData()
 
     def IsComplete(self):
-        if( len( self.data ) >= self.readSize ):
+#        logger.debug( "Data Length: %d; ReadSize: %d", len( self.data ), self.readSize )
+        print "Data length: ", len(self.data), " ReadSize: ", self.readSize
+        if( ( self.readSize != None ) and ( len( self.data ) >= self.readSize ) ):
+            logger.debug( "poll transaction complete" )
             return True
         else:
             return False
         
     def ProcessData(self):
-        print "   Process Data"
+        logger.debug( "Poll transaction: Process Data " )
+        print self.data
 
 
 class ClockTransaction(Transaction):
@@ -284,6 +297,39 @@ class MacroTransaction(Transaction):
         return True
 
 
+class StatusRequestTransaction(Transaction):
+    
+    def __init__(self, controller):
+        Transaction.__init__(self, controller)
+        logger.debug( "New status transaction" )
+        
+    def Start(self):
+        logger.debug( "Status transaction starting")
+        self.readSize = STAUS_REQUEST_NUM_BYTES
+        self.data = []
+        self.controller.write( STATUS_REQUEST )
+        return True
+    
+    def HandleMessage(self, message):
+            self.data.append( message.data[0] )
+            
+            if( len( self.data ) >= self.readSize ):
+                self.ProcessData()
+
+    def IsComplete(self):
+#        logger.debug( "Data Length: %d; ReadSize: %d", len( self.data ), self.readSize )
+        print "Data length: ", len(self.data), " ReadSize: ", self.readSize
+        if( ( self.readSize != None ) and ( len( self.data ) >= self.readSize ) ):
+            logger.debug( "Status transaction complete" )
+            return True
+        else:
+            return False
+        
+    def ProcessData(self):
+        logger.debug( "Status transaction: Process Data " )
+        print self.data
+
+
 # Classes to handle threading
 class QueueMessage():
     ( MSG_UNDEFINED,
@@ -298,11 +344,10 @@ class QueueMessage():
         self.data   = bytearray()
 
 
-class ThreadedSerialRead(threading.Thread):
+class ThreadSerialRead(threading.Thread):
     ( STATE_EXIT,
       STATE_BYTE,
-      STATE_BUFFER
-    ) = range(3)
+    ) = range(2)
 
     def __init__(self, msgQueue, transQueue, controller):
         threading.Thread.__init__(self)
@@ -311,17 +356,13 @@ class ThreadedSerialRead(threading.Thread):
         self.controller = controller
         
     def run(self):
-        print "Read thread started"
+        logger.debug(  "Read thread started" )
         state = self.STATE_BYTE
         
         while state != self.STATE_EXIT:
-            
-            if state == self.STATE_BYTE:
-                state = self.ReadByte()
-            elif state == self.STATE_BUFFER:
-                state = self.ReadBuffer()
+            state = self.ReadByte()
                 
-        print "Read thread exiting"
+        logger.debug( "Read thread exiting" )
         
     def ReadByte(self):
         newState = self.STATE_BYTE
@@ -331,37 +372,25 @@ class ThreadedSerialRead(threading.Thread):
 
             if data != "":
 
+                logger.debug( "Read 0x%02X", data )
+                
                 if( data == POLL_REQUEST ):
-                    transaction = PollTransaction( self.controller );
+                    logger.debug( "   creating poll transaction")
+                    transaction = PollTransaction( self.controller )
                     self.transQueue.AddTransaction( TransactionQueue.PRI_IMMEDIATE, transaction )
+                    
                 elif( data == POLL_POWER_FAIL ):
-                    transaction = ClockTransaction( self.controller );
+                    logger.debug( "   creating power fail transaction")
+                    transaction = ClockTransaction( self.controller )
                     self.transQueue.AddTransaction( TransactionQueue.PRI_IMMEDIATE, transaction )
+                    
                 else:
+                    logger.debug( "   putting in queue")
                     msg = QueueMessage( QueueMessage.MSG_READ )
                     msg.data.append( data )
                     self.msgQueue.AddMessage( msg )
                     
         except:
-            newState = self.STATE_EXIT
-            
-        return newState
-    
-    def ReadBuffer(self):
-        print "read buffer"
-        newState = self.STATE_BYTE
-
-        try:
-            size = self.controller.read()
-
-            if size != "":
-                if( ( size > 0 ) and ( size < MAX_READ_BYTES ) ):
-                    msg = QueueMessage( MSG_READ )
-                    while( --size ):
-                        msg.data.append( self.controller.read() )
-                    self.msgQueue.AddMessage( msg )
-                    
-        except ValueError:
             newState = self.STATE_EXIT
             
         return newState
@@ -463,7 +492,7 @@ class CM11(SerialX10Controller):
         SerialX10Controller.open(self, 1)
                     
         # Start the thread for reading 
-        self.readThread = ThreadedSerialRead( self.messages, self.transactions, self )
+        self.readThread = ThreadSerialRead( self.messages, self.transactions, self )
         self.readThread.start()
         
         # Start the thread for processing/writing
@@ -488,14 +517,21 @@ class CM11(SerialX10Controller):
     
     def ack(self):
         return True
+    
+    def StatusRequest(self):
+        self.do( functions.STATREQ )
 
-    def do(self, function, units=None, amount=None, suspend=None):
+    def do(self, function, units=None, amount=None ):
         event = None
         
         if( self.suspend ):
             event = threading.Event()
         
-        transaction = CommandTransaction( self, function, units, amount, event )
+        if( function == functions.STATREQ ):
+            transaction = StatusRequestTransaction( self )
+        else:
+            transaction = CommandTransaction( self, function, units, amount, event )
+            
         self.transactions.AddTransaction( TransactionQueue.PRI_NORMAL, transaction )
         
         if( self.suspend ):
