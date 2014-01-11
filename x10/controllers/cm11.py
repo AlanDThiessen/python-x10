@@ -9,6 +9,9 @@ from ..utils import *
 from x10.protocol import functions
 
 logger = logging.getLogger(__name__)
+logging.basicConfig( level=logging.DEBUG,
+                     format='%(asctime)s.%(msecs)03d %(name)-12s %(levelname)-8s %(message)s',
+                     datefmt='%Y-%m-%d %H:%M:%S' )
 
 CM11_BAUD       = 4800
 
@@ -55,10 +58,10 @@ class MessageQueue(Queue.Queue):
         
     def GetMessage(self):
         try:
-            message = self.get( True, 3 )
+            message = self.get( True, 4.6 )
             return message
         except Queue.Empty:
-            print "Message Queue Empty!"
+            logger.debug( "Message Queue Empty!" )
             return None
         except:
             return None
@@ -149,22 +152,22 @@ class CommandTransaction(Transaction):
         return( self.state == self.STATE_COMPLETE )
 
     def StateValidateChecksum(self, checksum):
-        print "   State Validate Checksum"
+        logger.debug( "   State Validate Checksum" )
 
         if( checksum == self.checksum ):
-            print "   Checksum Valid"
+            logger.debug( "   Checksum Valid" )
             # Since checksum matches, reset the number of attempts
             # and send Ok for Transmission
             #self.numAttempts = 0
             self.controller.write( XMIT_OK )
             self.state = self.STATE_WAIT_READY
         else:
-            print "   Checksum Invalid"
+            logger.debug( "   Checksum Invalid" )
             # Checksum mistmach, increment number of attempts and try again
             self.numAttempts += 1
             
             if( self.numAttempts > self.MAX_ATTEMPTS ):
-                print "   Max attempts reached"
+                logger.debug( "   Max attempts reached" )
                 self.state = self.STATE_COMPLETE
             else:
                 if( self.action == self.ACTION_ADDRESS ):
@@ -173,10 +176,10 @@ class CommandTransaction(Transaction):
                     self.SendFunction()
                     
     def StateWaitReady(self, response):
-        print "   State Wait Ready"                    
+        logger.debug( "   State Wait Ready" )
 
         if( response == INTERFACE_READY ):
-            print "   Interface ready"
+            logger.debug( "   Interface ready" )
 
             if( self.action == self.ACTION_ADDRESS ):
                 # Increment the current unit
@@ -192,23 +195,23 @@ class CommandTransaction(Transaction):
             elif( self.action == self.ACTION_FUNCTION ):
                 self.state = self.STATE_COMPLETE
         else:
-            print "   Device Not Ready"
+            logger.debug( "   Device Not Ready" )
             # Checksum mistmach, increment number of attempts and try again
             self.numAttempts += 1
 
             if( self.numAttempts > self.MAX_ATTEMPTS ):
-                print "   Max attempts reached"
+                logger.debug( "   Max attempts reached" )
                 self.state = self.STATE_COMPLETE
-            else:
-                self.state = self.STATE_VALIDATE_CHECKSUM
-                if( self.action == self.ACTION_ADDRESS ):
-                    self.AddressUnit()
-                elif( self.action == self.ACTION_FUNCTION ):
-                    self.SendFunction()
+            #else:
+                #self.state = self.STATE_VALIDATE_CHECKSUM
+                #if( self.action == self.ACTION_ADDRESS ):
+                    #self.AddressUnit()
+                #elif( self.action == self.ACTION_FUNCTION ):
+                    #self.SendFunction()
 
     def AddressUnit(self):
         if( self.currentUnit < len( self.units ) ):
-            print "   Address unit: ", self.units[self.currentUnit]
+            logger.debug( "   Address unit: %s", self.units[self.currentUnit] )
             
             self.action = self.ACTION_ADDRESS
             x10Addr = ( encodeX10HouseCode( self.units[self.currentUnit][0], self.controller ) << 4 ) | encodeX10UnitCode( self.units[self.currentUnit][1:], self.controller )
@@ -221,7 +224,7 @@ class CommandTransaction(Transaction):
             return False
         
     def SendFunction(self):
-        print "   Send Function: ", self.function
+        logger.debug( "   Send Function: %s", encodeFunctionName( self.function, self.controller ) )
         self.action = self.ACTION_FUNCTION
         
         cmd = (encodeX10HouseCode(self.units[0][0], self.controller) << 4) | self.function
@@ -394,7 +397,7 @@ class ThreadProcessTransactions(threading.Thread):
         self.controller = controller
         
     def run(self):
-        print "Process thread started"
+        logger.debug( "Process thread started" )
         
         # The CM11A device sends the Power Fail poll every second after initial
         # power-up, and will not respond to commands until that poll is satisfied.
@@ -424,7 +427,7 @@ class ThreadProcessTransactions(threading.Thread):
             else:
                 state = self.STATE_EXIT
                 
-        print "Process thread ending"
+        logger.debug( "Process thread ending" )
         
 
 class CM11(SerialX10Controller):
@@ -470,11 +473,6 @@ class CM11(SerialX10Controller):
         }
     
     def __init__(self, aDevice, suspend=False):
-        num = getattr( logging, 'DEBUG' )
-        if not isinstance( num, int ):
-            raise ValueError( 'Invalid log level: %s' % 'DEBUG' )
-        logging.basicConfig( level=num )
-
         SerialX10Controller.__init__(self, aDevice, CM11_BAUD)
         # The queue to use for communication
         self.messages = MessageQueue()
@@ -495,7 +493,7 @@ class CM11(SerialX10Controller):
         self.processThread.start()
         
     def close(self):
-        print "Closing device..."
+        logger.debug( "Closing device..." )
         # Closing the serial port should cause the read thread to terminate
         SerialX10Controller.close(self)
         
@@ -504,11 +502,11 @@ class CM11(SerialX10Controller):
         self.transactions.AddTransaction( TransactionQueue.PRI_EXIT, exit )
         
         # Now, wait for the threads to complete
-        print "Waiting for threads to end..."
+        logger.debug( "Waiting for threads to end..." )
         self.readThread.join()
-        print "   read thread done"
+        logger.debug( "   read thread done" )
         self.processThread.join()
-        print "   process thread done"
+        logger.debug( "   process thread done" )
     
     def ack(self):
         return True
@@ -527,15 +525,15 @@ class CM11(SerialX10Controller):
         self.transactions.AddTransaction( TransactionQueue.PRI_NORMAL, transaction )
         
         if( self.suspend ):
-            print "Waiting for event..."
+            logger.debug( "Waiting for event..." )
             event.wait()
-            print "Event Done!"
+            logger.debug( "Event Done!" )
     
     def StatusRequest(self):
         self.do( functions.STATREQ )
         
     def StatusResponse(self, data):
-        print "Status Response: ", data
+        logger.debug( "Status Response: ..." )
 
     def DecodeData(self, data):
         # First, get the Function/Address mask from the first byte
