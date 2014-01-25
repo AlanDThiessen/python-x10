@@ -26,6 +26,7 @@ POLL_PF_RESP            = 0x9B      # Respond to power fail poll
 
 # Receive Constants
 POLL_REQUEST            = 0x5A      # Poll request from CM11A
+POLL_EEPROM_ADDRESS     = 0x5B      # Two bytes following indicate address of timer/macro
 POLL_POWER_FAIL         = 0xA5      # Poll request indicating power fail
 INTERFACE_READY         = 0x55      # The interface is ready
 MAX_READ_BYTES          = 9         # The maximum number of bytes in the buffer after the size
@@ -48,7 +49,7 @@ class TransactionQueue(Queue.PriorityQueue):
         
     def GetTransaction(self):
         (priority, transaction) = self.get()
-        return transaction   
+        return transaction
 
 
 class MessageQueue(Queue.Queue):
@@ -124,6 +125,7 @@ class CommandTransaction(Transaction):
         self.units          = units
         self.function       = function
         self.amount         = amount
+        self.houseCode      = 0
         self.numAttempts    = 0
         self.currentUnit    = 0
         self.checksum       = 0
@@ -193,6 +195,7 @@ class CommandTransaction(Transaction):
                 self.state = self.STATE_VALIDATE_CHECKSUM
                 
             elif( self.action == self.ACTION_FUNCTION ):
+                self.controller.NotifyCommandCode( self.function, self.houseCode, self.amount, self.units )
                 self.state = self.STATE_COMPLETE
         else:
             logger.debug( "   Device Not Ready" )
@@ -202,12 +205,6 @@ class CommandTransaction(Transaction):
             if( self.numAttempts > self.MAX_ATTEMPTS ):
                 logger.debug( "   Max attempts reached" )
                 self.state = self.STATE_COMPLETE
-            #else:
-                #self.state = self.STATE_VALIDATE_CHECKSUM
-                #if( self.action == self.ACTION_ADDRESS ):
-                    #self.AddressUnit()
-                #elif( self.action == self.ACTION_FUNCTION ):
-                    #self.SendFunction()
 
     def AddressUnit(self):
         if( self.currentUnit < len( self.units ) ):
@@ -227,7 +224,9 @@ class CommandTransaction(Transaction):
         logger.debug( "   Send Function: %s", encodeFunctionName( self.function, self.controller ) )
         self.action = self.ACTION_FUNCTION
         
-        cmd = (encodeX10HouseCode(self.units[0][0], self.controller) << 4) | self.function
+        self.houseCode = self.units[0][0]
+        
+        cmd = (encodeX10HouseCode(self.houseCode, self.controller) << 4) | self.function
 
         # For the BRIGHT and DIM Commands, need to or in the amount to dim
         # into the top 5 bits of the header
@@ -246,34 +245,54 @@ class CommandTransaction(Transaction):
 
 class PollTransaction(Transaction):
     
-    def __init__(self, controller):
+    def __init__(self, controller, initialByte=None):
         Transaction.__init__(self, controller)
-        logger.debug( "New poll transaction" )
+        logger.debug( "New poll transaction: 0x%02X", initialByte )
+        self.readSize = None
+        self.data = []
+        self.data.append(initialByte)
+
+        if( initialByte == POLL_EEPROM_ADDRESS ):
+            self.readSize = 3   # This byte plus two following equals three total
+            logger.debug( "Poll transaction: initial readSize: %d", self.readSize)
         
     def Start(self):
         logger.debug( "********** Starting Poll Transaction **********" )
-        self.readSize = None
-        self.data = []
-        self.controller.write( POLL_RESPONSE )
+        self.complete = False
+        
+        # If it's a normal poll request, we need to respond, and the readSize
+        # will be the next byte read. 
+        if( self.data[0] == POLL_REQUEST):
+            self.controller.write( POLL_RESPONSE )
+            
         return True
     
     def HandleMessage(self, message):
         if( ( message.id == QueueMessage.MSG_READ ) and ( len( message.data ) >= 1 ) ):
             if( self.readSize == None ):
-                self.readSize = message.data[0]
+                self.readSize = message.data[0] + 1 # Need to account for the initial header byte
                 logger.debug( "Poll transaction: readSize: %d", self.readSize)
                 
                 if( self.readSize > MAX_READ_BYTES ):
                     self.readSize = MAX_READ_BYTES
                     
+                if( self.readSize == 0 ):
+                    self.complete = True
+                    
             else:
                 self.data.append( message.data[0] )
-                
+
+                if( ( self.readSize != None ) and ( len( self.data ) >= self.readSize ) ):
+                    self.complete = True
+
                 if( len( self.data ) >= self.readSize ):
                     self.controller.DecodeData( self.data )
+        else:
+            logger.debug( "Poll transaction: Read Timeout")
+            self.complete = True
 
     def IsComplete(self):
-        if( ( self.readSize != None ) and ( len( self.data ) >= self.readSize ) ):
+        if( self.complete ):
             logger.debug( "poll transaction complete" )
             return True
         else:
@@ -362,12 +381,12 @@ class ThreadSerialRead(threading.Thread):
         
         try:
             data = self.controller.read()
-
+    
             if data != "":
-
-                if( data == POLL_REQUEST ):
+    
+                if( ( data == POLL_REQUEST ) or ( data == POLL_EEPROM_ADDRESS ) ):
                     logger.debug( "   creating poll transaction")
-                    transaction = PollTransaction( self.controller )
+                    transaction = PollTransaction( self.controller, data )
                     self.transQueue.AddTransaction( TransactionQueue.PRI_IMMEDIATE, transaction )
                     
                 elif( data == POLL_POWER_FAIL ):
@@ -479,6 +498,7 @@ class CM11(SerialX10Controller):
         # The queue to use for transactions
         self.transactions = TransactionQueue()
         self.suspend = suspend
+        self.lastUnits = []
         
     def open(self):
         # Open the serial port
@@ -535,38 +555,69 @@ class CM11(SerialX10Controller):
     def StatusResponse(self, data):
         logger.debug( "Status Response: ..." )
 
+    def NotifyMacroExecuted(self, data):
+        logger.info( "Macro Executed: Address: 0x%02X%02X", data[0], data[1] )
+    
+    def NotifyCommandCode(self, functionCode, houseCode, amount, units ):
+        functionName = encodeFunctionName( functionCode, self )
+
+        # If there are unit codes specified, then we need to remember the last
+        # units operated on
+        if( len( units ) != 0 ):
+            self.lastUnits = units
+            
+        if( ( functionCode == functions.DIM ) or ( functionCode == functions.BRIGHT ) ):
+            percentage = round( amount * 100 / DIM_BRIGHT_MAX )
+            logger.info( "Command: Unit(s): %s, House: %1s, Function: %s, Amount: %.0f%%", ', '.join( map( str, self.lastUnits ) ), houseCode, functionName, percentage )
+        else:
+            logger.info( "Command: Unit(s): %s, House: %1s, Function: %s", ', '.join( map( str, self.lastUnits ) ), houseCode, functionName )
+        
     def DecodeData(self, data):
-        # First, get the Function/Address mask from the first byte
-        index = 0
-        funcAddrMask = data[index]
-        index += 1
+        initialByte = data.pop(0)
         
-        # The size is the number of bytes remaining
-        size = len( data ) - 1
-        
-        try:
-            while size:
-                # If the bit in the mask is a 1, the corresponding data byte is a function
-                # If the bit in the mask is a 0, the corresponding data byte is a house code
-                if( funcAddrMask & 0x01 ):
-                    functionCode = data[index] & 0x0F
-                    functionName = encodeFunctionName( functionCode, self )
-                    houseCode = decodeX10HouseCode( data[index] >> 4, self )
-                    
-                    if( ( functionCode == functions.DIM ) or ( functionCode == functions.BRIGHT ) ):
-                        index += 1
-                        size -= 1
-                        amount = round( data[index] * 100 / DIM_BRIGHT_MAX )
-                        logger.debug( "House: %1s, Function: %s (%d), Amount: %.0f%%", houseCode, functionName, functionCode, amount )
-                    else:
-                        logger.debug( "House, %1s, Function: %s (%d)", houseCode, functionName, functionCode )
+        if( initialByte == POLL_EEPROM_ADDRESS ):
+            self.NotifyMacroExecuted( data )
+        elif( initialByte == POLL_REQUEST ):
+            # First, get the Function/Address mask from the first byte
+            index = 0
+            funcAddrMask = data[index]
+            index += 1
+            
+            # The size is the number of bytes remaining
+            size = len( data ) - 1
+            
+            functionCode = 0
+            houseCode = 0
+            amount = 0
+            unitCode = []
+            
+            try:
+                while size:
+                    # If the bit in the mask is a 1, the corresponding data byte is a function
+                    # If the bit in the mask is a 0, the corresponding data byte is a house code
+                    if( funcAddrMask & 0x01 ):
+                        # The function code is in the lower nibble
+                        functionCode = data[index] & 0x0F
+                        # The house code is in the upper nibble
+                        houseCode = decodeX10HouseCode( data[index] >> 4, self )
                         
-                else:
-                    unitCode = decodeX10Address( data[index], self )
-                    logger.debug( "Unit: %s", unitCode )
-                    
-                funcAddrMask = funcAddrMask >> 1
-                index += 1
-                size -= 1
-        except:
-            logger.debug( "Decode Failure" )
+                        # If it's a bright or dim command, then there is another byte listing the amount
+                        if( ( functionCode == functions.DIM ) or ( functionCode == functions.BRIGHT ) ):
+                            index += 1
+                            size -= 1
+                            amount = data[index]
+    
+                        self.NotifyCommandCode( functionCode, houseCode, amount, unitCode )
+                        
+                        # Reinitialize since there could be more in the buffer
+                        amount = 0
+                        unitCode = []
+                            
+                    else:
+                        unitCode.append( decodeX10Address( data[index], self ) )
+                        
+                    funcAddrMask = funcAddrMask >> 1
+                    index += 1
+                    size -= 1
+            except:
+                logger.debug( "Decode Failure" )
