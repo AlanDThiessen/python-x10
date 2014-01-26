@@ -5,6 +5,7 @@ import threading
 import time
 
 from .abstract import SerialX10Controller, X10Controller
+from x10.devices.notifier import Notifier
 from ..utils import *
 from x10.protocol import functions
 
@@ -499,6 +500,7 @@ class CM11(SerialX10Controller):
         self.transactions = TransactionQueue()
         self.suspend = suspend
         self.lastUnits = []
+        self.notifiers = []
         
     def open(self):
         # Open the serial port
@@ -548,7 +550,10 @@ class CM11(SerialX10Controller):
             logger.debug( "Waiting for event..." )
             event.wait()
             logger.debug( "Event Done!" )
-    
+
+    def AddNotifier(self, notifier):
+        self.notifiers.append( notifier )
+        
     def StatusRequest(self):
         self.do( functions.STATREQ )
         
@@ -565,7 +570,11 @@ class CM11(SerialX10Controller):
         # units operated on
         if( len( units ) != 0 ):
             self.lastUnits = units
-            
+
+        # Go through the notifiers and send notification
+        for notifier in self.notifiers:
+            notifier.Notify( houseCode, functionCode, functionName, amount, self.lastUnits )
+
         if( ( functionCode == functions.DIM ) or ( functionCode == functions.BRIGHT ) ):
             percentage = round( amount * 100 / DIM_BRIGHT_MAX )
             logger.info( "Command: Unit(s): %s, House: %1s, Function: %s, Amount: %.0f%%", ', '.join( map( str, self.lastUnits ) ), houseCode, functionName, percentage )
